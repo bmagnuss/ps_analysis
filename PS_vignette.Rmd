@@ -1,0 +1,250 @@
+---
+title: "Mayzent principal stratum analysis"
+author: "Baldur Magnusson"
+date: "01/20/2021"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+bibliography: vignette.bib
+csl: acm.csl
+---
+
+```{r setup, cache=FALSE, echo=FALSE}
+library(knitr)
+knitr::read_chunk("PS_model.stan", labels="data", from=1, to=37)
+knitr::read_chunk("PS_model.stan", labels="params", from=38, to=48)
+knitr::read_chunk("PS_model.stan", labels="tparams", from=49, to=68)
+knitr::read_chunk("PS_model.stan", labels="model_priors", from=69, to=81)
+knitr::read_chunk("PS_model.stan", labels="model_lik", from=83, to=140)
+knitr::read_chunk("PS_model.stan", labels="gdat", from=141, to=183)
+# repeat for other chunks as needed
+knitr::opts_chunk$set(echo = TRUE,fig.width=1.62*5,fig.height=5,cache=TRUE)
+```
+
+# Introduction
+
+This vignette demonstrates how to use the data provided in the online supplement of [@magnusson2018bayesian] ("the paper") to reproduce the corresponding main results shown in figures 1 and 2. 
+
+The following steps are involved:
+
+- Read the data into a format that is usable by R (data frame)
+- Read the Stan program and inspect the various program blocks that comprise the overall model
+- Compile and run the Stan model
+- Post-process and summarize the outputs 
+
+First load the required packages. 
+
+```{r, message=FALSE}
+library(tidyverse)
+library(rstan)
+library(bayesplot)
+```
+
+# Data
+
+The first step is to enter the data as provided in the online supplement of the paper. We use a `trt_vec` vector for easy reference to the two treatment arms. Note this data corresponds to the month 12 timepoint. 
+
+```{r}
+trt_vec <- c("baf","pbo")
+
+base_data <- data.frame(covstr=c(1,2,3,4),
+                        rand=c(315,455,275,596))
+
+res_data <- data.frame(covstr=sort(rep(1:4,4)),
+                       rel=rep(c(0,0,1,1),4),
+                       trt=rep(trt_vec,8),
+                       avail=c(145,68,22,13,221,109,15,17,125,63,20,11,304,130,13,7),
+                       cdp=c(25,15,5,7,44,26,7,9,13,14,7,4,56,19,5,1))
+
+```
+
+# Stan model
+
+For a detailed introduction to the Stan programming language, the reader can refer to [@Carpenter2017] or [@stanman]. 
+
+A typical Stan program is divided into several programming blocks: 
+
+- `functions:` User-defined functions (not used in our program)
+- `data`: Declaration of all the data required by our model that will be passed to Stan from the calling program, e.g. `R`
+- `transformed data`: Declaration and definition of constants and transformed data (not used in our program)
+- `parameters`: Declaration of model parameters
+- `transformed parameters`: Declaration and definition of variables that are functions of other variables and/or data
+- `model`: Definition of prior distributions and likelihood
+- `generated quantities`: Derived quantities based on parameters, data, and (optionally) pseudo random number generation
+
+We will look at each block of our program and discuss specifics that might not be obvious from merely reading the code. The entire program is printed in the appendix. 
+
+## `data` block
+
+```{r data, echo=TRUE, eval=FALSE}
+```
+
+Extensive comments should make the purpose of each variable reasonably clear. Notes: 
+
+- Stan is strongly typed, so when declaring a variable, e.g. `Ntrt`, we have to specify its type (`int`) and, in the case of multi-dimensional variables, e.g. `px`, the dimension
+- A few variables pertain to individual level data. Since the data in table 2 was provided at the summary level, we will have to convert to individual level data before fitting the model
+- Some of the variables, e.g. `px` or `Di`, correspond to actual clinical data whereas other variables such as `ind_prior` are "control variables" in the sense that they will direct behavior of the program at run-time
+- Parameters to the prior distributions are also passed as data which is favorable to hard coding in the program, for example to facilitate easy execution of sensitivity analyses
+
+## `parameters` block
+
+```{r params, echo=TRUE, eval=FALSE}
+```
+
+This block is straightforward. We declare parameters corresponding to the principal strata, one parameter per principal stratum and covariate stratum combination. These are the $\alpha_{g,x}$ in the notation of the paper. We also define separate vectors by principal stratum. The disability rate parameters are declared similarly, i.e. by principal stratum and covariate stratum. 
+
+## `transformed parameters` block
+
+```{r tparams, echo=TRUE, eval=FALSE}
+```
+
+In this block, we declare the two variables that will feed into the likelihood in the `model` block, `alpha` and `theta`. The variable `alpha` is an array of vectors and `theta` is an array of matrices. 
+
+Notes: 
+
+- Every entry of `alpha[x,BEN]` is set to zero. This is the identifiability constraint of the softmax function, referred to in section 4 of the paper
+- Note use of the control variable `ind_prior`, where `theta` corresponding to active treatment (`BAF`) is set as `delta` in the case of independent parameterization for treatment effect, or set as `theta_pbo + delta` for dependent parameterization
+
+## `model` block
+
+The `model` block is relatively large and for ease of exposition split it into two parts.
+
+```{r model_priors, echo=TRUE, eval=FALSE}
+```
+
+The first chunk of code specifies prior distributions for all parameters of the model (i.e. all parameters specified in the `parameters` block). Every parameter is assigned a normal prior, with specific parameters as specified in the input to the program. Note that if we do not specify a prior here, Stan will automatically assign a uniform prior on the unconstrained space (it is recommended to always specify your own priors). 
+
+```{r model_lik, echo=TRUE, eval=FALSE}
+```
+
+The first for loop calculates the current value of $\pi_x$, corresponding to the current sample from the posterior, using the `softmax` function and also the mixture weights that are used in specification of the disability model likelihood. Refer to Table 1 of the paper. 
+
+The second for loop goes through all individual observations and calculates the log probability density function based on the observed data. (Incrementing the log probability density function is the basis of execution of a Stan program -- refer to the Stan manual @stanman for details). `rprob` and `dprob` are vectors of log probabilities for each observation, corresponding to observed relapses and observed disability progressions, respectively. The parameters that apply for each vector entry depend on the corresponding treatment assignment and observed value for relapse (Table 1 of the paper).
+
+In the first if-statement clause (`IH`, i.e. immune or harmed, i.e. $(S,Z)=(0,0)$), the likelihood contribution for the relapse model is would therefore be written in terms of the sum of probabilities from a categorical distribution ($\pi_I$ and $\pi_H$). One could simply write `rprob[i] = pi_temp[IMM] + pi_temp[HAR]` but, because the Stan sampler is most efficient on an unconstrained space, we use the log probability mass function (`_lpmf`) for the logit-scaled categorical distribution. The function `log_sum_exp(x)` is simply a computationally stable function that returns the logarithm of the sum of the exponentials of the elements in `x`. For disability progressions, the log probability is updated with the log mixture of the log Bernoulli probability mass functions corresponding to the two principal strata that apply. The mixture weight `mix_weight` was calculated in the code block shown previously. 
+
+Minor notes: 
+
+- The lone curly braces surrounding this code are used so that variables declared within are not saved for post-processing (saves space)
+- If `use_data` is set to zero, this chunk will not execute, and the program will only sample from the prior. This is a useful flag to include in your program as it allows to easily switch between prior and posterior sampling without writing any additional code. 
+- The statements `target += rprob` and `target += dprob` increment the log probability based on the values assigned to `rprob` and `dprob` in this iteration of the sampler
+
+## The `generated quantities` block
+
+```{r gdat, echo=TRUE, eval=FALSE}
+```
+
+In this block we implement the standardization calculations to derive the marginal quantities $\pi_g$ and $\theta_g$ defined in section 4 of the paper. The standardization formulae are given in Equation (4). 
+
+# Pre-processing
+
+Prepare data for sampling. This involves converting the summary data to individual-level data as mentioned above. For this we use the `by_row` function from the `purrrlyr` package. 
+
+```{r}
+# reference data frames
+ps_names <- c("IMM", "DOO", "BEN", "HAR") 
+ps_df <- data.frame(psn = 1:4, ps = factor(ps_names, levels = ps_names))
+Nx <- max(res_data$covstr)
+rel_ps <- data.frame(rel = c(0,0,1,1),
+                     trt = rep(rev(trt_vec), 2), 
+                     ps = c(1,2,3,4),
+                     str = c("IH", "IB", "DB", "DH"))
+
+px_data <- base_data %>% mutate(px = rand/sum(rand))
+
+# convert the summary data into individual level data for sampling in Stan
+adata <- res_data %>% purrrlyr::by_row(function(x) {
+    data.frame(ri = rep(x$rel, x$avail),
+               di = c(rep(1, x$cdp), rep(0, x$avail - x$cdp)))
+  }, .collate = "rows")  %>% 
+  select(covstr, trt, rel = ri, cdp = di) %>%
+  inner_join(rel_ps, by = c("rel","trt"))
+
+# the th_prior mean is based on a two-year expected disability rate, so we adjust to one year 
+# (since the analysis is for the 12 month time point) using an exponential distribution
+th_prior <- c(0.3, 2)
+th_la <- -log(1 - th_prior[1])/2 # lambda is the year rate
+p0 <- pexp(1, rate = th_la) # p0 = P(exp < 1 year) w/the lambda suggested by two year prob. of 0.3
+lm0 <- log(p0/(1-p0)) # prior mean is on the logit scale
+
+standat <- list(Ntrt = length(trt_vec),
+                Nstr = length(ps_names),
+                Ncat = max(rel_ps$ps),
+                Nx = Nx,
+                px = as.numeric(px_data$px),
+                Ni = sum(res_data$avail),
+                cat = adata$ps,
+                Di = adata$cdp,
+                Xstr = adata$covstr,
+                alpha_prior = c(0, 2),
+                alpha_H_prior = c(-50, 0.1),
+                theta_pbo_prior = matrix(c(rep(lm0, Nx), rep(th_prior[2], Nx)), ncol = 2),
+                delta_prior = matrix(c(rep(0, Nx), rep(2, Nx)), ncol = 2),
+                ind_prior = 0,
+                use_data = 1,
+                IMM = ps_df$psn[ps_df$ps == "IMM"], DOO = ps_df$psn[ps_df$ps == "DOO"], 
+                BEN = ps_df$psn[ps_df$ps == "BEN"], HAR = ps_df$psn[ps_df$ps == "HAR"],
+                IB = rel_ps$ps[rel_ps$str == "IB"], DB = rel_ps$ps[rel_ps$str == "DB"],
+                IH = rel_ps$ps[rel_ps$str == "IH"], DH = rel_ps$ps[rel_ps$str == "DH"],
+                BAF = 1, PBO = 2
+)
+```
+
+# Sampling & post-processing
+
+We are now ready to compile and sample from our model. Note the use of multiple cores to parallelize the individual chains. 
+
+```{r, message=FALSE, eval=FALSE}
+mod <- stan_model("PS_model.stan") # compiles the model
+
+options(mc.cores = parallel::detectCores())
+fit <- sampling(mod, data=standat, seed=9, iter=2000)
+```
+
+
+```{r, echo=FALSE}
+# save pre-compiled model & fit for faster generation
+if (FALSE) {
+  saveRDS(mod, "PS_mod_compiled.rds")
+  saveRDS(fit, "PS_mod_fit.rds")
+}
+fit <- readRDS("PS_mod_fit.rds") 
+```
+
+Let's restrict our attention to two key parameter vectors, `pi` and `rr_PS`. 
+
+```{r}
+par_out <- c("pi", "rr_PS")
+print(fit, pars=par_out)
+mcmc_trace(as.array(fit), regex_pars=par_out)
+```
+
+An initial glance at the inference printout and trace plots does not raise any concerns (high `n_eff`, `Rhat` equal to 1, good mixing in trace plots). A number of diagnostics can (and should) be run to assess the quality of sampling, convergence, etc. For more information, the package `bayesplot` has an excellent vignette on MCMC diagnostics. 
+
+Finally, let's visualize the estimated principal stratum proportions and the risk ratio in the non-relapser stratum. 
+
+```{r}
+mcmc_intervals(as.array(fit), regex_pars = "pi") + labs(title = "Principal strata posteriors")
+mcmc_intervals(as.array(fit), regex_pars = "rr_PS") + labs(title = "Posterior risk ratios")
+```
+
+Conclusions: 
+
+- Substantial majority of patients belong ot non-relapser principal stratum 
+- Positive effect in non-relapser stratum (not significant), wide credibiilty intervals
+- Risk ratios in benefiter and harmed strata should be mostly dismissed as they are not identifiable and mostly reflect assumptions placed on parameter distributions
+
+# References
+
+<div id="refs"></div>
+
+# Appendix 
+
+```{r}
+sessionInfo()
+```
+
+```{r}
+writeLines(readLines("PS_model.stan"))
+```
